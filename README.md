@@ -1,14 +1,14 @@
-# Flask API объявлений о металлопрокате
+# aiohttp API объявлений о металлопрокате
 
 Для запуска в PowerShell откройте папку проекта и выполните:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python -m flask --app app run
+.\.venv\Scripts\python -m aiohttp.web -H 127.0.0.1 -P 8080 app:init_app
 ```
 
-Сервер принимает запросы на http://127.0.0.1:5000. При первом обращении к базе рядом с app.py появится файл ads.sqlite3. Дата создания задаётся сервером в UTC.
+Сервер принимает запросы на http://127.0.0.1:8080. При запуске рядом с app.py появится файл ads.sqlite3. Дата создания задаётся сервером в UTC.
 
 | Метод | Путь | Результат |
 |---|---|---|
@@ -20,7 +20,7 @@ py -m venv .venv
 Пример для второго окна PowerShell:
 
 ```powershell
-$base = 'http://127.0.0.1:5000/ads'
+$base = 'http://127.0.0.1:8080/ads'
 $json = @{title='Лист стальной 09Г2С'; description='Толщина 8 мм, партия 2 т'; owner='МеталлСнаб'} | ConvertTo-Json
 $type = 'application/json; charset=utf-8'
 $ad = Invoke-RestMethod $base -Method Post -ContentType $type -Body ([Text.Encoding]::UTF8.GetBytes($json))
