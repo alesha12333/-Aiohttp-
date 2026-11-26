@@ -1,20 +1,31 @@
-import sqlite3
+import asyncio
 from pathlib import Path
 
-from flask import Flask, abort, g, jsonify, request, url_for
-from werkzeug.exceptions import HTTPException
+import aiosqlite
+from aiohttp import web
 
-app = Flask(__name__)
-app.config["DATABASE"] = Path(__file__).with_name("ads.sqlite3")
-app.json.ensure_ascii = False
 FIELDS = ("title", "description", "owner")
+DATABASE = web.AppKey("database", Path)
+DB = web.AppKey("db", aiosqlite.Connection)
+DB_LOCK = web.AppKey("db_lock", asyncio.Lock)
 
 
-def database():
-    if "db" not in g:
-        g.db = sqlite3.connect(app.config["DATABASE"])
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("""
+@web.middleware
+async def http_error(request, handler):
+    try:
+        return await handler(request)
+    except web.HTTPException as error:
+        headers = error.headers.copy()
+        headers.pop("Content-Type", None)
+        return web.json_response(
+            {"error": error.text}, status=error.status, headers=headers
+        )
+
+
+async def database_context(app):
+    async with aiosqlite.connect(app[DATABASE], isolation_level=None) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS ads (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
@@ -24,76 +35,93 @@ def database():
                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             )
         """)
-    return g.db
+        app[DB] = db
+        app[DB_LOCK] = asyncio.Lock()
+        yield
 
 
-@app.teardown_appcontext
-def close_database(error):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
-
-@app.errorhandler(HTTPException)
-def http_error(error):
-    response = error.get_response()
-    response.data = app.json.dumps({"error": error.description})
-    response.content_type = "application/json"
-    return response
-
-
-def read_fields(partial=False):
-    data = request.get_json()
+async def read_fields(request, partial=False):
+    if request.content_type != "application/json" and not (
+        request.content_type.startswith("application/")
+        and request.content_type.endswith("+json")
+    ):
+        raise web.HTTPUnsupportedMediaType(text="Ожидается application/json.")
+    try:
+        data = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="Некорректный JSON.")
     if not isinstance(data, dict) or not data:
-        abort(400, description="Нужен непустой JSON-объект.")
+        raise web.HTTPBadRequest(text="Нужен непустой JSON-объект.")
     if data.keys() - set(FIELDS):
-        abort(400, description="Допустимые поля: title, description, owner.")
+        raise web.HTTPBadRequest(text="Допустимые поля: title, description, owner.")
     if not partial and set(FIELDS) - data.keys():
-        abort(400, description="Укажите title, description и owner.")
+        raise web.HTTPBadRequest(text="Укажите title, description и owner.")
     for key, value in data.items():
         if not isinstance(value, str) or not value.strip():
-            abort(400, description=f"Поле {key} должно содержать текст.")
+            raise web.HTTPBadRequest(text=f"Поле {key} должно содержать текст.")
     return {key: value.strip() for key, value in data.items()}
 
 
-def find_ad(ad_id):
-    row = database().execute("SELECT * FROM ads WHERE id = ?", (ad_id,)).fetchone()
+async def find_ad(db, ad_id):
+    async with db.execute("SELECT * FROM ads WHERE id = ?", (ad_id,)) as cursor:
+        row = await cursor.fetchone()
     if row is None:
-        abort(404, description="Объявление не найдено.")
+        raise web.HTTPNotFound(text="Объявление не найдено.")
     return dict(row)
 
 
-@app.post("/ads")
-def create_ad():
-    data = read_fields()
-    with database() as db:
-        cursor = db.execute(
+async def create_ad(request):
+    data = await read_fields(request)
+    db = request.app[DB]
+    async with request.app[DB_LOCK]:
+        async with db.execute(
             "INSERT INTO ads (title, description, owner) VALUES (:title, :description, :owner)",
             data,
-        )
-        ad = find_ad(cursor.lastrowid)
-    return jsonify(ad), 201, {"Location": url_for("get_ad", ad_id=ad["id"])}
+        ) as cursor:
+            ad = await find_ad(db, cursor.lastrowid)
+    return web.json_response(ad, status=201, headers={"Location": f"/ads/{ad['id']}"})
 
 
-@app.get("/ads/<int:ad_id>")
-def get_ad(ad_id):
-    return jsonify(find_ad(ad_id))
+async def get_ad(request):
+    async with request.app[DB_LOCK]:
+        ad = await find_ad(request.app[DB], request.match_info["ad_id"])
+    return web.json_response(ad)
 
 
-@app.patch("/ads/<int:ad_id>")
-def update_ad(ad_id):
-    data = read_fields(partial=True)
+async def update_ad(request):
+    data = await read_fields(request, partial=True)
     assignments = ", ".join(f"{key} = :{key}" for key in FIELDS if key in data)
-    with database() as db:
-        db.execute(f"UPDATE ads SET {assignments} WHERE id = :id", {**data, "id": ad_id})
-        ad = find_ad(ad_id)
-    return jsonify(ad)
+    db = request.app[DB]
+    ad_id = request.match_info["ad_id"]
+    async with request.app[DB_LOCK]:
+        async with db.execute(
+            f"UPDATE ads SET {assignments} WHERE id = :id", {**data, "id": ad_id}
+        ):
+            pass
+        ad = await find_ad(db, ad_id)
+    return web.json_response(ad)
 
 
-@app.delete("/ads/<int:ad_id>")
-def delete_ad(ad_id):
-    with database() as db:
-        cursor = db.execute("DELETE FROM ads WHERE id = ?", (ad_id,))
-        if cursor.rowcount == 0:
-            abort(404, description="Объявление не найдено.")
-    return "", 204
+async def delete_ad(request):
+    async with request.app[DB_LOCK]:
+        async with request.app[DB].execute(
+            "DELETE FROM ads WHERE id = ?", (request.match_info["ad_id"],)
+        ) as cursor:
+            if cursor.rowcount == 0:
+                raise web.HTTPNotFound(text="Объявление не найдено.")
+    return web.Response(status=204)
+
+
+def init_app(argv=None):
+    app = web.Application(middlewares=[http_error])
+    app[DATABASE] = Path(__file__).with_name("ads.sqlite3")
+    app.cleanup_ctx.append(database_context)
+    app.router.add_post("/ads", create_ad)
+    app.router.add_get(r"/ads/{ad_id:\d+}", get_ad)
+    app.router.add_patch(r"/ads/{ad_id:\d+}", update_ad)
+    app.router.add_delete(r"/ads/{ad_id:\d+}", delete_ad)
+    return app
+
+
+if __name__ == "__main__":
+    web.run_app(init_app(), host="127.0.0.1", port=8080)
